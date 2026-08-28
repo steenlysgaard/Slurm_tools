@@ -5,10 +5,13 @@
 # The reservation is needed to allow backfill to schedule jobs that end before the reservation expires. 
 # The reservation should then be removed by update.sh after the reboot.
 #
-# By default, one reservation is created per node, each starting when that node's
-# last currently running job is expected to end. With -s/--single-reservation,
-# one reservation is created for all requested nodes, starting when the last job
-# across all requested nodes is expected to end. This implies
+# By default, one reservation is created or updated per node, each starting when
+# that node's last currently running job is expected to end. Existing future
+# reservations managed by this script are moved to the current expected idle
+# time. Already-started reservations are left unchanged. With
+# -s/--single-reservation, one reservation is created or updated for all
+# requested nodes, starting when the last job across all requested nodes is
+# expected to end. This implies
 # -k/--keep-reservation because update.sh removes per-node reservations named
 # update-<node>. Single reservations are named reservation-<folded-nodelist>,
 # with commas and brackets replaced by underscores. If that name is too long,
@@ -77,9 +80,116 @@ make_single_reservation_name(){
     printf '%s\n' "${SINGLE_RESERVATION_NAME_PREFIX}-${first_part:0:$available}${suffix}"
 }
 
+reservation_field(){
+    local reservation="$1"
+    local field="$2"
+    local regex="(^|[[:space:]])${field}=([^[:space:]]+)"
+
+    if [[ "$reservation" =~ $regex ]]; then
+        printf '%s\n' "${BASH_REMATCH[2]}"
+    fi
+}
+
+time_to_epoch(){
+    local time_value="$1"
+
+    if [[ "$time_value" == "Now" ]]; then
+        date +%s
+        return
+    fi
+
+    date -d "$time_value" +%s 2>/dev/null
+}
+
+find_existing_reservation(){
+    local res_name="$1"
+    local reservation reservation_name
+
+    while IFS= read -r reservation; do
+        reservation_name=$(reservation_field "$reservation" "ReservationName")
+        if [[ "$reservation_name" == "$res_name" ]]; then
+            printf '%s\n' "$reservation"
+            return
+        fi
+    done <<< "$EXISTING_RESERVATIONS"
+}
+
+create_reservation(){
+    local res_name="$1"
+    local start_time="$2"
+    local nodes="$3"
+
+    scontrol create reservation \
+             ReservationName="$res_name" \
+             StartTime="$start_time" \
+             Duration="$RESERVATION_DURATION" \
+             Nodes="$nodes" \
+             Users=root \
+             Flags=MAINT >/dev/null
+}
+
+update_or_create_reservation(){
+    local res_name="$1"
+    local start_time="$2"
+    local nodes="$3"
+    local scope="$4"
+    local reservation existing_start existing_duration now_epoch existing_start_epoch new_start_epoch
+    local -a duration_arg=()
+
+    reservation=$(find_existing_reservation "$res_name")
+    if [[ -z "$reservation" ]]; then
+        info "Creating reservationname=$res_name starting $start_time for $scope $nodes"
+        create_reservation "$res_name" "$start_time" "$nodes"
+        return
+    fi
+
+    existing_start=$(reservation_field "$reservation" "StartTime")
+    if [[ -z "$existing_start" ]]; then
+        info "  Reservation $res_name already exists, but StartTime could not be read; not updating"
+        return
+    fi
+
+    now_epoch=$(date +%s)
+    existing_start_epoch=$(time_to_epoch "$existing_start") || {
+        info "  Reservation $res_name already exists, but StartTime=$existing_start could not be parsed; not updating"
+        return
+    }
+
+    if (( existing_start_epoch <= now_epoch )); then
+        info "  Reservation $res_name has already started; not updating"
+        return
+    fi
+
+    new_start_epoch=$(time_to_epoch "$start_time") || {
+        info "  Computed start time $start_time could not be parsed; not updating reservation $res_name"
+        return
+    }
+
+    if (( existing_start_epoch == new_start_epoch )); then
+        info "  Reservation $res_name already starts at $existing_start; not updating"
+        return
+    fi
+
+    if [[ "$duration_arg_set" == true ]]; then
+        duration_arg=(Duration="$RESERVATION_DURATION")
+        info "  Updating reservation $res_name StartTime from $existing_start to $start_time and Duration to $RESERVATION_DURATION"
+    else
+        existing_duration=$(reservation_field "$reservation" "Duration")
+        if [[ -z "$existing_duration" ]]; then
+            info "  Reservation $res_name already exists, but Duration could not be read; not updating"
+            return
+        fi
+        duration_arg=(Duration="$existing_duration")
+        info "  Updating reservation $res_name StartTime from $existing_start to $start_time and keeping Duration $existing_duration"
+    fi
+
+    scontrol update ReservationName="$res_name" StartTime="$start_time" "${duration_arg[@]}" >/dev/null
+}
+
 single_reservation=false
 keep_reservation=false
 RESERVATION_DURATION="$DEFAULT_RESERVATION_DURATION"
+duration_arg_set=false
 
 normalized_args=()
 # support long options --single-reservation, --keep-reservation, --help,
@@ -125,6 +235,7 @@ while getopts ":skhd:" opt; do
             ;;
         d)
             RESERVATION_DURATION="$OPTARG"
+            duration_arg_set=true
             ;;
         h)
             usage
@@ -174,6 +285,9 @@ readarray -t NODES < <(scontrol show hostnames "$HOSTLIST")
 # when parsing end times from squeue
 unset SLURM_TIME_FORMAT
 
+# Snapshot reservations once so per-node lookups do not query slurmctld.
+EXISTING_RESERVATIONS=$(scontrol -o show reservation 2>/dev/null || true)
+
 if [[ "$single_reservation" == true ]]; then
     latest_endtime=$(squeue -h -w "$HOSTLIST" -O Endtime | sort | tail -1)
     if [[ -z "$latest_endtime" ]]
@@ -186,16 +300,10 @@ if [[ "$single_reservation" == true ]]; then
     # match the per-node update-<node> names removed by update.sh after reboot.
     res_name=$(make_single_reservation_name "$HOSTLIST" "${#NODES[@]}")
 
-    # Create one reservation for the full node set. This waits for the busiest
-    # selected node to become idle before reserving all requested nodes together.
-    info "Creating reservationname=$res_name starting $latest_endtime for nodes $HOSTLIST"
-    scontrol create reservation \
-             ReservationName="$res_name" \
-             StartTime="$latest_endtime" \
-             Duration="$RESERVATION_DURATION" \
-             Nodes="$HOSTLIST" \
-             Users=root \
-             Flags=MAINT >/dev/null
+    # Create or update one reservation for the full node set. This waits for
+    # the busiest selected node to become idle before reserving all requested
+    # nodes together.
+    update_or_create_reservation "$res_name" "$latest_endtime" "$HOSTLIST" "nodes"
 else
     for node in "${NODES[@]}"; do
         info "Processing node $node ..."
@@ -211,15 +319,8 @@ else
         # reservations that should be removed after the reboot
         res_name="${RESERVATION_NAME_PREFIX}-${node}"
 
-        # Create reservation (per node). This lets backfill allow only
-        # jobs that finish before start.
-        info "  Creating reservationname=$res_name starting $endtime for node $node"
-        scontrol create reservation \
-                 ReservationName="$res_name" \
-                 StartTime="$endtime" \
-                 Duration="$RESERVATION_DURATION" \
-                 Nodes="$node" \
-                 Users=root \
-                 Flags=MAINT >/dev/null
+        # Create or update reservation (per node). This lets backfill allow
+        # only jobs that finish before start.
+        update_or_create_reservation "$res_name" "$endtime" "$node" "node"
     done
 fi
